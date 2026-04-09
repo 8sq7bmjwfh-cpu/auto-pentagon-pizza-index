@@ -1,0 +1,47 @@
+name: PizzINT Daily Monitor
+
+on:
+  schedule:
+    # 北京时间周一到周五 08:30 = UTC 00:30
+    - cron: '30 0 * * 1-5'
+  workflow_dispatch:
+
+jobs:
+  run-monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run monitor
+        env:
+          PIZZINT_URL: https://www.pizzint.watch/
+          TIMEZONE: Asia/Shanghai
+          REQUEST_TIMEOUT: 30
+          OUTPUT_DIR: output
+          SMTP_HOST: smtp.qq.com
+          SMTP_PORT: 465
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+        run: python pizzint_monitor.py
+
+      - name: Upload snapshot artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pizzint-output
+          path: output/
+          if-no-files-found: warn

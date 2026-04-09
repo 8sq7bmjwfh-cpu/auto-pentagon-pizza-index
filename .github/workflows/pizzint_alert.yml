@@ -1,0 +1,58 @@
+name: PizzINT Doughcon Alert
+
+on:
+  schedule:
+    # 每 15 分钟轮询一次（UTC），用于监控 Doughcon 变化并触发 1/2 级告警
+    - cron: "*/15 * * * 1-5"
+  workflow_dispatch:
+
+jobs:
+  monitor-alert:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Restore Doughcon state cache
+        id: state-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: output/doughcon_state.json
+          key: doughcon-state-${{ github.ref_name }}-${{ github.run_id }}
+          restore-keys: |
+            doughcon-state-${{ github.ref_name }}-
+
+      - name: Run alert monitor
+        env:
+          RUN_MODE: alert
+          ALERT_LEVELS: "1,2"
+          STATE_FILE: output/doughcon_state.json
+          PIZZINT_URL: https://www.pizzint.watch/
+          TIMEZONE: Asia/Shanghai
+          REQUEST_TIMEOUT: 30
+          OUTPUT_DIR: output
+          SMTP_HOST: smtp.qq.com
+          SMTP_PORT: 465
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+        run: python pizzint_monitor.py
+
+      - name: Save Doughcon state cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: output/doughcon_state.json
+          key: doughcon-state-${{ github.ref_name }}-${{ github.run_id }}
