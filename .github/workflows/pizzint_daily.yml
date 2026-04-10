@@ -2,8 +2,8 @@ name: PizzINT Daily Monitor
 
 on:
   schedule:
-    # 北京时间周一到周五 16:25 = UTC 08:25
-    - cron: '25 8 * * 1-5'
+    # 北京时间周一到周五 16:30 = UTC 08:30
+    - cron: '30 8 * * 1-5'
   workflow_dispatch:
 
 jobs:
