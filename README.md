@@ -2,7 +2,6 @@
 
 这个项目会在北京时间工作日 08:30 抓取 `https://www.pizzint.watch/` 首页公开内容，提取：
 
-- Pizza Index（如果首页公开 HTML 中能直接解析到数值）
 - Doughcon 等级
 - Doughcon 文案
 - 异常门店信息
@@ -62,7 +61,7 @@ python pizzint_monitor.py
 
 - GitHub Actions 的 cron 使用 UTC；这里已经换算成北京时间工作日 08:30。
 - GitHub 定时任务通常接近设定时间执行，但不保证精确到秒。
-- `pizzint.watch` 首页公开 HTML 当前可稳定解析到 `DOUGHCON` 和门店状态；数值型 `Pizza Index` 是否能直接抓到，取决于站点当时是否把该值直接输出在 HTML 或脚本里。
+- `pizzint.watch` 首页公开 HTML 当前可稳定解析到 `DOUGHCON` 和门店状态。
 - 如果将来站点结构变化，可能需要调整解析规则。
 
 ## 5. 输出示例

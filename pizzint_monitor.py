@@ -35,6 +35,14 @@ QUIET_STATUSES = {
     "LOADING TACTICAL DATA...",
 }
 
+DOUGHCON_LABELS = {
+    1: "Maximum Readiness",
+    2: "Next Step to Maximum Readiness",
+    3: "Increase in Force Readiness",
+    4: "Increased Intelligence Watch",
+    5: "Lowest State of Readiness",
+}
+
 IGNORE_LINE_PATTERNS = [
     re.compile(r"^POPULAR TIMES ANALYSIS$", re.I),
     re.compile(r"^LOADING TACTICAL DATA\.\.\.$", re.I),
@@ -62,7 +70,6 @@ class PizzintSnapshot:
     site_url: str
     doughcon_level: int | None
     doughcon_label: str | None
-    pizza_index: str | None
     locations_monitored: int | None
     active_stores_count: int
     spike_stores_count: int
@@ -117,17 +124,11 @@ def extract_text_lines(html: str) -> list[str]:
 
 
 def extract_doughcon(lines: list[str]) -> tuple[int | None, str | None]:
-    for idx, line in enumerate(lines):
+    for line in lines:
         m = re.search(r"DOUGHCON\s*(\d+)", line, re.I)
         if m:
             level = int(m.group(1))
-            label = None
-            for nxt in lines[idx + 1 : idx + 4]:
-                if nxt.startswith("###"):
-                    continue
-                if nxt and not re.search(r"SUPPORT|POWERED BY|Intel by the Slice", nxt, re.I):
-                    label = nxt
-                    break
+            label = DOUGHCON_LABELS.get(level)
             return level, label
     return None, None
 
@@ -137,20 +138,6 @@ def extract_locations_monitored(lines: list[str]) -> int | None:
         m = re.search(r"(\d+)\s+LOCATIONS\s+MONITORED", line, re.I)
         if m:
             return int(m.group(1))
-    return None
-
-
-def extract_index(html: str, lines: list[str]) -> str | None:
-    del lines
-    patterns = [
-        re.compile(r'"(?:pizzaIndex|indexValue|overallIndex|currentIndex)"\s*:\s*"?([\d\.]+)"?', re.I),
-        re.compile(r"(?:overall|pizza)\s+index\s*(?:value)?\s*[:=]\s*([\d]{1,3}(?:\.\d+)?)", re.I),
-        re.compile(r"data-index\s*=\s*[\"']([\d]{1,3}(?:\.\d+)?)[\"']", re.I),
-    ]
-    for pattern in patterns:
-        m = pattern.search(html)
-        if m:
-            return m.group(1)
     return None
 
 
@@ -284,8 +271,6 @@ def build_snapshot(html: str) -> PizzintSnapshot:
     notes: list[str] = []
     if not stores:
         notes.append("No store blocks were parsed. Page structure may have changed.")
-    if extract_index(html, lines) is None:
-        notes.append("Pizza Index value was not reliably found in public HTML.")
 
     return PizzintSnapshot(
         fetched_at_bj=now_bj.strftime("%Y-%m-%d %H:%M:%S %Z"),
@@ -293,7 +278,6 @@ def build_snapshot(html: str) -> PizzintSnapshot:
         site_url=URL,
         doughcon_level=doughcon_level,
         doughcon_label=doughcon_label,
-        pizza_index=extract_index(html, lines),
         locations_monitored=extract_locations_monitored(lines),
         active_stores_count=active_stores_count,
         spike_stores_count=spike_stores_count,
@@ -315,7 +299,6 @@ def render_email_text(snapshot: PizzintSnapshot) -> str:
     lines = [
         f"PizzINT Daily Snapshot (Beijing): {snapshot.fetched_at_bj}",
         f"URL: {snapshot.site_url}",
-        f"Pizza Index: {snapshot.pizza_index or 'N/A'}",
         f"Doughcon: {snapshot.doughcon_level or 'N/A'}",
         f"Doughcon Label: {snapshot.doughcon_label or 'N/A'}",
         f"Locations Monitored: {snapshot.locations_monitored or 'N/A'}",
@@ -386,7 +369,6 @@ def render_email_html(snapshot: PizzintSnapshot) -> str:
            <strong>UTC:</strong> {snapshot.fetched_at_utc}<br>
            <strong>URL:</strong> <a href="{snapshot.site_url}">{snapshot.site_url}</a></p>
         <ul>
-          <li><strong>Pizza Index:</strong> {snapshot.pizza_index or 'N/A'}</li>
           <li><strong>Doughcon:</strong> {snapshot.doughcon_level or 'N/A'}</li>
           <li><strong>Doughcon Label:</strong> {snapshot.doughcon_label or 'N/A'}</li>
           <li><strong>Locations Monitored:</strong> {snapshot.locations_monitored or 'N/A'}</li>
