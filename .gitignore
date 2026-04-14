@@ -1,4 +1,6 @@
-
+__pycache__/
 output/
-.env
-
+*.pyc
+.DS_Store
+pizzint_monitor_full/
+pizzint_monitor_full.zip

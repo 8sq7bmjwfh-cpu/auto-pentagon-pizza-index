@@ -1,12 +1,12 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import os
 import re
 import smtplib
 import ssl
-from dataclasses import dataclass, asdict
-from datetime import datetime, timedelta
+from dataclasses import asdict, dataclass
+from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
@@ -20,13 +20,6 @@ URL = os.getenv("PIZZINT_URL", "https://www.pizzint.watch/")
 TIMEZONE = os.getenv("TIMEZONE", "Asia/Shanghai")
 OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "output"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
-RUN_MODE = os.getenv("RUN_MODE", "daily").strip().lower()
-STATE_FILE = Path(os.getenv("STATE_FILE", str(OUTPUT_DIR / "doughcon_state.json")))
-ALERT_LEVELS = {
-    int(x.strip())
-    for x in os.getenv("ALERT_LEVELS", "1,2").split(",")
-    if x.strip().isdigit() and 1 <= int(x.strip()) <= 5
-}
 USER_AGENT = os.getenv(
     "USER_AGENT",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -37,6 +30,7 @@ QUIET_STATUSES = {
     "QUIET",
     "CLOSED",
     "NORMAL",
+    "NOMINAL",
     "NO DATA",
     "LOADING TACTICAL DATA...",
 }
@@ -49,21 +43,6 @@ IGNORE_LINE_PATTERNS = [
 ]
 
 STORE_NAME_RE = re.compile(r"^[A-Z0-9&'\.\-\s]{3,}$")
-DOUGHCON_LEVEL_RE = re.compile(r"DOUGHCON\s*([1-5])", re.I)
-RELATIVE_HOURS_RE = re.compile(r"(\d+)\s*(?:H|HR|HRS|HOUR|HOURS)\s+AGO", re.I)
-RELATIVE_MINUTES_RE = re.compile(r"(\d+)\s*(?:M|MIN|MINS|MINUTE|MINUTES)\s+AGO", re.I)
-ABSOLUTE_DATETIME_PATTERNS = [
-    re.compile(r"(\d{4}-\d{2}-\d{2})[ T](\d{1,2}:\d{2})(?:[:]\d{2})?\s*(UTC|GMT|CST)?", re.I),
-    re.compile(r"([A-Z][a-z]{2,8}\s+\d{1,2},\s+\d{4})\s+(\d{1,2}:\d{2}\s*[AP]M)\s*(UTC|GMT|CST)?", re.I),
-    re.compile(r"(\d{1,2}:\d{2}\s*[AP]M)\s*(UTC|GMT|CST)?", re.I),
-]
-DOUGHCON_LABEL_MAP = {
-    1: "Maximum Readiness",
-    2: "Next Step to Maximum Readiness",
-    3: "Increase in Force Readiness",
-    4: "Increased Intelligence Watch",
-    5: "Lowest State of Readiness",
-}
 
 
 @dataclass
@@ -71,6 +50,8 @@ class StoreInfo:
     name: str
     status: str | None = None
     distance_mi: float | None = None
+    spike_percent: float | None = None
+    signal_score: float = 0.0
     anomalous: bool = False
 
 
@@ -79,24 +60,22 @@ class PizzintSnapshot:
     fetched_at_bj: str
     fetched_at_utc: str
     site_url: str
-    current_doughcon_level: int | None
-    current_doughcon_label: str | None
-    doughcon_changes_12h: list["DoughconChange"]
+    doughcon_level: int | None
+    doughcon_label: str | None
+    pizza_index: str | None
     locations_monitored: int | None
+    active_stores_count: int
+    spike_stores_count: int
+    max_spike_percent: float | None
+    pentagon_signal_score: float
     anomalous_stores: list[StoreInfo]
+    top_signal_stores: list[StoreInfo]
     all_stores: list[StoreInfo]
     raw_notes: list[str]
 
 
-@dataclass
-class DoughconChange:
-    observed_at_bj: str
-    level: int
-    level_label: str
-
-
 def normalize_line(line: str) -> str:
-    line = line.replace("\xa0", " ").replace("•", " • ")
+    line = line.replace("\xa0", " ").replace("’", "'").replace("–", "-")
     line = re.sub(r"\s+", " ", line).strip()
     return line
 
@@ -124,56 +103,6 @@ def get_html(url: str) -> str:
     resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
     resp.raise_for_status()
     return resp.text
-
-
-def load_env_file(path: str = ".env") -> None:
-    env_path = Path(path)
-    if not env_path.exists():
-        return
-    for line in env_path.read_text(encoding="utf-8").splitlines():
-        text = line.strip()
-        if not text or text.startswith("#") or "=" not in text:
-            continue
-        key, value = text.split("=", 1)
-        key = key.strip()
-        value = value.strip()
-        if key and key not in os.environ:
-            os.environ[key] = value
-
-
-def refresh_runtime_config() -> None:
-    global URL, TIMEZONE, OUTPUT_DIR, REQUEST_TIMEOUT, RUN_MODE, STATE_FILE, ALERT_LEVELS, USER_AGENT
-    URL = os.getenv("PIZZINT_URL", "https://www.pizzint.watch/")
-    TIMEZONE = os.getenv("TIMEZONE", "Asia/Shanghai")
-    OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "output"))
-    REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
-    RUN_MODE = os.getenv("RUN_MODE", "daily").strip().lower()
-    STATE_FILE = Path(os.getenv("STATE_FILE", str(OUTPUT_DIR / "doughcon_state.json")))
-    parsed_alert_levels = {
-        int(x.strip())
-        for x in os.getenv("ALERT_LEVELS", "1,2").split(",")
-        if x.strip().isdigit() and 1 <= int(x.strip()) <= 5
-    }
-    ALERT_LEVELS = parsed_alert_levels or {1, 2}
-    USER_AGENT = os.getenv(
-        "USER_AGENT",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    )
-
-
-def load_state() -> dict[str, Any]:
-    if not STATE_FILE.exists():
-        return {}
-    try:
-        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return {}
-
-
-def save_state(data: dict[str, Any]) -> None:
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def extract_text_lines(html: str) -> list[str]:
@@ -204,91 +133,60 @@ def extract_doughcon(lines: list[str]) -> tuple[int | None, str | None]:
 
 
 def extract_locations_monitored(lines: list[str]) -> int | None:
-    for line in lines[:30]:
+    for line in lines[:40]:
         m = re.search(r"(\d+)\s+LOCATIONS\s+MONITORED", line, re.I)
         if m:
             return int(m.group(1))
     return None
 
 
-def parse_event_time(text: str, now_bj: datetime) -> datetime | None:
-    match = RELATIVE_HOURS_RE.search(text)
-    if match:
-        hours = int(match.group(1))
-        return now_bj - timedelta(hours=hours)
-
-    match = RELATIVE_MINUTES_RE.search(text)
-    if match:
-        minutes = int(match.group(1))
-        return now_bj - timedelta(minutes=minutes)
-
-    for pattern in ABSOLUTE_DATETIME_PATTERNS:
-        match = pattern.search(text)
-        if not match:
-            continue
-        groups = match.groups()
-        tz_name = (groups[-1] or "").upper()
-        tz = ZoneInfo("UTC") if tz_name in {"UTC", "GMT"} else ZoneInfo(TIMEZONE)
-        try:
-            if pattern is ABSOLUTE_DATETIME_PATTERNS[0]:
-                dt = datetime.strptime(f"{groups[0]} {groups[1]}", "%Y-%m-%d %H:%M").replace(tzinfo=tz)
-                return dt.astimezone(ZoneInfo(TIMEZONE))
-            if pattern is ABSOLUTE_DATETIME_PATTERNS[1]:
-                dt = datetime.strptime(f"{groups[0]} {groups[1]}", "%B %d, %Y %I:%M %p").replace(tzinfo=tz)
-                return dt.astimezone(ZoneInfo(TIMEZONE))
-            if pattern is ABSOLUTE_DATETIME_PATTERNS[2]:
-                base_date = now_bj.date()
-                dt = datetime.strptime(groups[0], "%I:%M %p").replace(
-                    year=base_date.year,
-                    month=base_date.month,
-                    day=base_date.day,
-                    tzinfo=tz,
-                )
-                dt = dt.astimezone(ZoneInfo(TIMEZONE))
-                if dt > now_bj + timedelta(minutes=5):
-                    dt = dt - timedelta(days=1)
-                return dt
-        except ValueError:
-            continue
+def extract_index(html: str, lines: list[str]) -> str | None:
+    del lines
+    patterns = [
+        re.compile(r'"(?:pizzaIndex|indexValue|overallIndex|currentIndex)"\s*:\s*"?([\d\.]+)"?', re.I),
+        re.compile(r"(?:overall|pizza)\s+index\s*(?:value)?\s*[:=]\s*([\d]{1,3}(?:\.\d+)?)", re.I),
+        re.compile(r"data-index\s*=\s*[\"']([\d]{1,3}(?:\.\d+)?)[\"']", re.I),
+    ]
+    for pattern in patterns:
+        m = pattern.search(html)
+        if m:
+            return m.group(1)
     return None
 
 
-def extract_doughcon_changes_12h(lines: list[str], now_bj: datetime) -> list[DoughconChange]:
-    entries: list[tuple[datetime, int]] = []
-    seen: set[tuple[str, int]] = set()
+def extract_spike_percent(text: str | None) -> float | None:
+    if not text:
+        return None
+    m = re.search(r"(\d{1,3}(?:\.\d+)?)\s*%", text, re.I)
+    if not m:
+        return None
+    return float(m.group(1))
 
-    for idx, line in enumerate(lines):
-        level_match = DOUGHCON_LEVEL_RE.search(line)
-        if not level_match:
-            continue
-        level = int(level_match.group(1))
-        context_parts = [line]
-        if idx > 0:
-            context_parts.append(lines[idx - 1])
-        if idx + 1 < len(lines):
-            context_parts.append(lines[idx + 1])
-        context_text = " ".join(context_parts)
-        event_time = parse_event_time(context_text, now_bj)
-        if event_time is None:
-            continue
 
-        key = (event_time.strftime("%Y-%m-%d %H:%M"), level)
-        if key in seen:
-            continue
-        seen.add(key)
-        entries.append((event_time, level))
+def calc_store_signal_score(status: str | None, distance_mi: float | None) -> float:
+    if not status:
+        return 0.0
 
-    window_start = now_bj - timedelta(hours=12)
-    filtered = [(ts, lv) for ts, lv in entries if window_start <= ts <= now_bj + timedelta(minutes=5)]
-    filtered.sort(key=lambda x: x[0])
-    return [
-        DoughconChange(
-            observed_at_bj=ts.strftime("%Y-%m-%d %H:%M:%S %Z"),
-            level=lv,
-            level_label=DOUGHCON_LABEL_MAP.get(lv, "Unknown"),
-        )
-        for ts, lv in filtered
-    ]
+    upper = status.upper()
+    spike_percent = extract_spike_percent(status) or 0.0
+    if upper in QUIET_STATUSES and spike_percent <= 0:
+        return 0.0
+
+    # Percent spike is the primary signal. Keywords are additive hints.
+    base = min(spike_percent, 300.0) / 3.0
+    if any(token in upper for token in ["SPIKE", "SURGE"]):
+        base += 18.0
+    elif any(token in upper for token in ["BUSY", "HIGH", "ELEVATED", "ALERT"]):
+        base += 10.0
+    elif upper not in QUIET_STATUSES:
+        base += 6.0
+
+    if distance_mi is None:
+        distance_factor = 0.75
+    else:
+        distance_factor = max(0.35, 1.0 - (distance_mi / 15.0) * 0.65)
+
+    return round(min(100.0, base * distance_factor), 2)
 
 
 def parse_store_block(block_lines: list[str], store_name: str) -> StoreInfo:
@@ -308,16 +206,18 @@ def parse_store_block(block_lines: list[str], store_name: str) -> StoreInfo:
             status = line
             continue
 
-    anomalous = False
-    if status:
-        upper = status.upper()
-        if upper not in QUIET_STATUSES:
-            if any(token in upper for token in ["SPIKE", "BUSY", "SURGE", "%", "ALERT", "HIGH", "ELEVATED"]):
-                anomalous = True
-            elif upper not in QUIET_STATUSES:
-                anomalous = True
+    spike_percent = extract_spike_percent(status)
+    signal_score = calc_store_signal_score(status, distance)
+    anomalous = signal_score > 0
 
-    return StoreInfo(name=store_name, status=status, distance_mi=distance, anomalous=anomalous)
+    return StoreInfo(
+        name=store_name,
+        status=status,
+        distance_mi=distance,
+        spike_percent=spike_percent,
+        signal_score=signal_score,
+        anomalous=anomalous,
+    )
 
 
 def extract_stores(lines: list[str]) -> list[StoreInfo]:
@@ -342,76 +242,111 @@ def extract_stores(lines: list[str]) -> list[StoreInfo]:
     return stores
 
 
+def summarize_pentagon_signal(stores: list[StoreInfo]) -> tuple[int, int, float | None, float, list[StoreInfo]]:
+    active_stores = [s for s in stores if s.status and s.status.upper() not in QUIET_STATUSES]
+    spike_stores = [s for s in stores if s.spike_percent is not None and s.spike_percent >= 20]
+    max_spike = max((s.spike_percent for s in stores if s.spike_percent is not None), default=None)
+
+    ranked = sorted(
+        [s for s in stores if s.signal_score > 0],
+        key=lambda s: (s.signal_score, s.spike_percent or 0.0, -(s.distance_mi or 999.0)),
+        reverse=True,
+    )
+    top_signal_stores = ranked[:5]
+
+    if not ranked:
+        total_score = 0.0
+    else:
+        avg_top3 = sum(s.signal_score for s in ranked[:3]) / min(3, len(ranked))
+        active_bonus = min(20.0, len(active_stores) * 3.5)
+        nearby_active_bonus = min(15.0, sum(1 for s in active_stores if (s.distance_mi or 999.0) <= 3.0) * 5.0)
+        total_score = min(100.0, round(avg_top3 + active_bonus + nearby_active_bonus, 2))
+
+    return len(active_stores), len(spike_stores), max_spike, total_score, top_signal_stores
+
+
 def build_snapshot(html: str) -> PizzintSnapshot:
     lines = extract_text_lines(html)
     doughcon_level, doughcon_label = extract_doughcon(lines)
     stores = extract_stores(lines)
     anomalous_stores = [store for store in stores if store.anomalous]
+    (
+        active_stores_count,
+        spike_stores_count,
+        max_spike_percent,
+        pentagon_signal_score,
+        top_signal_stores,
+    ) = summarize_pentagon_signal(stores)
+
     now_utc = datetime.now(tz=ZoneInfo("UTC"))
     now_bj = now_utc.astimezone(ZoneInfo(TIMEZONE))
-    doughcon_changes_12h = extract_doughcon_changes_12h(lines, now_bj)
 
     notes: list[str] = []
     if not stores:
-        notes.append("未解析到门店列表，可能是页面结构发生变化。")
-    if not doughcon_changes_12h:
-        notes.append("未解析到过去12小时内可识别时间戳的 Doughcon 变化记录。")
+        notes.append("No store blocks were parsed. Page structure may have changed.")
+    if extract_index(html, lines) is None:
+        notes.append("Pizza Index value was not reliably found in public HTML.")
 
-    snapshot = PizzintSnapshot(
+    return PizzintSnapshot(
         fetched_at_bj=now_bj.strftime("%Y-%m-%d %H:%M:%S %Z"),
         fetched_at_utc=now_utc.strftime("%Y-%m-%d %H:%M:%S %Z"),
         site_url=URL,
-        current_doughcon_level=doughcon_level,
-        current_doughcon_label=doughcon_label or (DOUGHCON_LABEL_MAP.get(doughcon_level) if doughcon_level else None),
-        doughcon_changes_12h=doughcon_changes_12h,
+        doughcon_level=doughcon_level,
+        doughcon_label=doughcon_label,
+        pizza_index=extract_index(html, lines),
         locations_monitored=extract_locations_monitored(lines),
+        active_stores_count=active_stores_count,
+        spike_stores_count=spike_stores_count,
+        max_spike_percent=max_spike_percent,
+        pentagon_signal_score=pentagon_signal_score,
         anomalous_stores=anomalous_stores,
+        top_signal_stores=top_signal_stores,
         all_stores=stores,
         raw_notes=notes,
     )
-    return snapshot
 
 
 def snapshot_to_dict(snapshot: PizzintSnapshot) -> dict[str, Any]:
-    data = asdict(snapshot)
-    return data
+    return asdict(snapshot)
 
 
 def render_email_text(snapshot: PizzintSnapshot) -> str:
+    max_spike = f"{snapshot.max_spike_percent:.1f}%" if snapshot.max_spike_percent is not None else "N/A"
     lines = [
-        f"PizzINT 日报（北京时间）: {snapshot.fetched_at_bj}",
-        f"网站链接: {snapshot.site_url}",
-        f"当前 Doughcon: {snapshot.current_doughcon_level or '未知'}",
-        f"当前等级说明: {snapshot.current_doughcon_label or '无'}",
-        f"监控门店数: {snapshot.locations_monitored or '未知'}",
+        f"PizzINT Daily Snapshot (Beijing): {snapshot.fetched_at_bj}",
+        f"URL: {snapshot.site_url}",
+        f"Pizza Index: {snapshot.pizza_index or 'N/A'}",
+        f"Doughcon: {snapshot.doughcon_level or 'N/A'}",
+        f"Doughcon Label: {snapshot.doughcon_label or 'N/A'}",
+        f"Locations Monitored: {snapshot.locations_monitored or 'N/A'}",
+        f"Active Stores: {snapshot.active_stores_count}",
+        f"Spike Stores (>=20%): {snapshot.spike_stores_count}",
+        f"Max Spike: {max_spike}",
+        f"Pentagon Pizza Signal Score: {snapshot.pentagon_signal_score:.1f}/100",
         "",
-        "过去12小时 Doughcon 变化:",
+        "Top Signals (Top 5):",
     ]
 
-    if snapshot.doughcon_changes_12h:
-        for change in snapshot.doughcon_changes_12h:
-            lines.append(f"- {change.observed_at_bj} | DOUGHCON {change.level}: {change.level_label}")
+    if snapshot.top_signal_stores:
+        for store in snapshot.top_signal_stores:
+            distance = f"{store.distance_mi:.1f} mi" if store.distance_mi is not None else "N/A"
+            spike = f"{store.spike_percent:.1f}%" if store.spike_percent is not None else "-"
+            lines.append(
+                f"- {store.name} | {store.status or 'N/A'} | spike={spike} | score={store.signal_score:.1f} | {distance}"
+            )
     else:
-        lines.append("- 未解析到过去12小时的 Doughcon 变化记录")
+        lines.append("- No elevated store signal detected")
 
-    lines.extend([
-        "",
-        "异常门店:",
-    ])
-    if snapshot.anomalous_stores:
-        for store in snapshot.anomalous_stores:
-            distance = f"{store.distance_mi:.1f} mi" if store.distance_mi is not None else "距离未知"
-            lines.append(f"- {store.name} | {store.status or '状态未知'} | {distance}")
-    else:
-        lines.append("- 当前未识别到异常门店")
-
-    lines.extend(["", "全部门店:"])
+    lines.extend(["", "All Stores:"])
     for store in snapshot.all_stores:
-        distance = f"{store.distance_mi:.1f} mi" if store.distance_mi is not None else "距离未知"
-        lines.append(f"- {store.name} | {store.status or '状态未知'} | {distance}")
+        distance = f"{store.distance_mi:.1f} mi" if store.distance_mi is not None else "N/A"
+        spike = f"{store.spike_percent:.1f}%" if store.spike_percent is not None else "-"
+        lines.append(
+            f"- {store.name} | {store.status or 'N/A'} | spike={spike} | score={store.signal_score:.1f} | {distance}"
+        )
 
     if snapshot.raw_notes:
-        lines.extend(["", "备注:"])
+        lines.extend(["", "Notes:"])
         for note in snapshot.raw_notes:
             lines.append(f"- {note}")
 
@@ -421,105 +356,60 @@ def render_email_text(snapshot: PizzintSnapshot) -> str:
 def render_email_html(snapshot: PizzintSnapshot) -> str:
     def rows(items: list[StoreInfo]) -> str:
         if not items:
-            return "<tr><td colspan='3'>当前未识别到异常门店</td></tr>"
+            return "<tr><td colspan='5'>No elevated store signal detected</td></tr>"
+
         html_rows = []
         for store in items:
-            distance = f"{store.distance_mi:.1f} mi" if store.distance_mi is not None else "距离未知"
+            distance = f"{store.distance_mi:.1f} mi" if store.distance_mi is not None else "N/A"
+            spike = f"{store.spike_percent:.1f}%" if store.spike_percent is not None else "-"
             html_rows.append(
                 "<tr>"
                 f"<td>{store.name}</td>"
-                f"<td>{store.status or '状态未知'}</td>"
+                f"<td>{store.status or 'N/A'}</td>"
+                f"<td>{spike}</td>"
+                f"<td>{store.signal_score:.1f}</td>"
                 f"<td>{distance}</td>"
                 "</tr>"
             )
         return "".join(html_rows)
 
-    def doughcon_change_rows(items: list[DoughconChange]) -> str:
-        if not items:
-            return "<tr><td colspan='3'>未解析到过去12小时的 Doughcon 变化记录</td></tr>"
-        html_rows = []
-        for item in items:
-            html_rows.append(
-                "<tr>"
-                f"<td>{item.observed_at_bj}</td>"
-                f"<td>DOUGHCON {item.level}</td>"
-                f"<td>{item.level_label}</td>"
-                "</tr>"
-            )
-        return "".join(html_rows)
-
+    top_rows = rows(snapshot.top_signal_stores)
     all_rows = rows(snapshot.all_stores)
-    anomaly_rows = rows(snapshot.anomalous_stores)
-    doughcon_rows = doughcon_change_rows(snapshot.doughcon_changes_12h)
-    notes_html = "".join(f"<li>{note}</li>" for note in snapshot.raw_notes) if snapshot.raw_notes else "<li>无</li>"
+    notes_html = "".join(f"<li>{note}</li>" for note in snapshot.raw_notes) if snapshot.raw_notes else "<li>None</li>"
+    max_spike = f"{snapshot.max_spike_percent:.1f}%" if snapshot.max_spike_percent is not None else "N/A"
 
     return f"""
     <html>
       <body style="font-family: Arial, Helvetica, sans-serif; line-height: 1.5;">
-        <h2>PizzINT 日报</h2>
-        <p><strong>北京时间：</strong>{snapshot.fetched_at_bj}<br>
-           <strong>UTC：</strong>{snapshot.fetched_at_utc}<br>
-           <strong>站点：</strong><a href="{snapshot.site_url}">{snapshot.site_url}</a></p>
+        <h2>PizzINT Daily Snapshot</h2>
+        <p><strong>Beijing Time:</strong> {snapshot.fetched_at_bj}<br>
+           <strong>UTC:</strong> {snapshot.fetched_at_utc}<br>
+           <strong>URL:</strong> <a href="{snapshot.site_url}">{snapshot.site_url}</a></p>
         <ul>
-          <li><strong>当前 Doughcon：</strong>{snapshot.current_doughcon_level or '未知'}</li>
-          <li><strong>当前等级说明：</strong>{snapshot.current_doughcon_label or '无'}</li>
-          <li><strong>监控门店数：</strong>{snapshot.locations_monitored or '未知'}</li>
+          <li><strong>Pizza Index:</strong> {snapshot.pizza_index or 'N/A'}</li>
+          <li><strong>Doughcon:</strong> {snapshot.doughcon_level or 'N/A'}</li>
+          <li><strong>Doughcon Label:</strong> {snapshot.doughcon_label or 'N/A'}</li>
+          <li><strong>Locations Monitored:</strong> {snapshot.locations_monitored or 'N/A'}</li>
+          <li><strong>Active Stores:</strong> {snapshot.active_stores_count}</li>
+          <li><strong>Spike Stores (&gt;=20%):</strong> {snapshot.spike_stores_count}</li>
+          <li><strong>Max Spike:</strong> {max_spike}</li>
+          <li><strong>Pentagon Pizza Signal Score:</strong> {snapshot.pentagon_signal_score:.1f}/100</li>
         </ul>
 
-        <h3>过去12小时 Doughcon 变化</h3>
+        <h3>Top Signals (Top 5)</h3>
         <table border="1" cellspacing="0" cellpadding="6">
-          <tr><th>时间（北京时间）</th><th>等级</th><th>说明</th></tr>
-          {doughcon_rows}
+          <tr><th>Store</th><th>Status</th><th>Spike</th><th>Signal Score</th><th>Distance</th></tr>
+          {top_rows}
         </table>
 
-        <h3>异常门店</h3>
+        <h3>All Stores</h3>
         <table border="1" cellspacing="0" cellpadding="6">
-          <tr><th>门店</th><th>状态</th><th>距离</th></tr>
-          {anomaly_rows}
-        </table>
-
-        <h3>全部门店</h3>
-        <table border="1" cellspacing="0" cellpadding="6">
-          <tr><th>门店</th><th>状态</th><th>距离</th></tr>
+          <tr><th>Store</th><th>Status</th><th>Spike</th><th>Signal Score</th><th>Distance</th></tr>
           {all_rows}
         </table>
 
-        <h3>备注</h3>
+        <h3>Notes</h3>
         <ul>{notes_html}</ul>
-      </body>
-    </html>
-    """
-
-
-def render_alert_text(snapshot: PizzintSnapshot, previous_level: int | None) -> str:
-    current_level = snapshot.current_doughcon_level
-    current_label = snapshot.current_doughcon_label or DOUGHCON_LABEL_MAP.get(current_level or 0, "Unknown")
-    prev_str = str(previous_level) if previous_level is not None else "未知"
-    lines = [
-        f"PizzINT Doughcon 告警（北京时间）: {snapshot.fetched_at_bj}",
-        f"网站链接: {snapshot.site_url}",
-        f"上次记录等级: {prev_str}",
-        f"当前等级: DOUGHCON {current_level}: {current_label}" if current_level else "当前等级: 未知",
-        f"告警条件: DOUGHCON {sorted(ALERT_LEVELS)}",
-    ]
-    return "\n".join(lines)
-
-
-def render_alert_html(snapshot: PizzintSnapshot, previous_level: int | None) -> str:
-    current_level = snapshot.current_doughcon_level
-    current_label = snapshot.current_doughcon_label or DOUGHCON_LABEL_MAP.get(current_level or 0, "Unknown")
-    prev_str = str(previous_level) if previous_level is not None else "未知"
-    return f"""
-    <html>
-      <body style="font-family: Arial, Helvetica, sans-serif; line-height: 1.5;">
-        <h2>PizzINT Doughcon 告警</h2>
-        <p><strong>北京时间：</strong>{snapshot.fetched_at_bj}<br>
-           <strong>站点：</strong><a href="{snapshot.site_url}">{snapshot.site_url}</a></p>
-        <ul>
-          <li><strong>上次记录等级：</strong>{prev_str}</li>
-          <li><strong>当前等级：</strong>{f"DOUGHCON {current_level}: {current_label}" if current_level else "未知"}</li>
-          <li><strong>告警条件：</strong>{", ".join(f"DOUGHCON {x}" for x in sorted(ALERT_LEVELS))}</li>
-        </ul>
       </body>
     </html>
     """
@@ -531,6 +421,7 @@ def save_snapshot(snapshot: PizzintSnapshot) -> Path:
     path = OUTPUT_DIR / f"pizzint_snapshot_{timestamp}.json"
     with path.open("w", encoding="utf-8") as f:
         json.dump(snapshot_to_dict(snapshot), f, ensure_ascii=False, indent=2)
+
     latest = OUTPUT_DIR / "latest.json"
     latest.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
     return path
@@ -544,7 +435,7 @@ def send_email(subject: str, text_body: str, html_body: str) -> None:
     mail_to = os.getenv("MAIL_TO")
 
     if not smtp_user or not smtp_pass or not mail_to:
-        print("未检测到 SMTP_USER / SMTP_PASS / MAIL_TO，跳过邮件发送。")
+        print("SMTP_USER / SMTP_PASS / MAIL_TO not found, skip email sending.")
         return
 
     msg = MIMEMultipart("alternative")
@@ -555,78 +446,28 @@ def send_email(subject: str, text_body: str, html_body: str) -> None:
     msg.attach(MIMEText(html_body, "html", "utf-8"))
 
     context = ssl.create_default_context()
-    try:
-        with smtplib.SMTP_SSL(smtp_host, smtp_port, context=context) as server:
-            server.login(smtp_user, smtp_pass)
-            server.sendmail(smtp_user, [x.strip() for x in mail_to.split(",") if x.strip()], msg.as_string())
-    except OSError as exc:
-        print(f"邮件发送失败: {exc}")
+    with smtplib.SMTP_SSL(smtp_host, smtp_port, context=context) as server:
+        server.login(smtp_user, smtp_pass)
+        recipients = [x.strip() for x in mail_to.split(",") if x.strip()]
+        server.sendmail(smtp_user, recipients, msg.as_string())
 
 
 def main() -> None:
-    load_env_file(".env")
-    refresh_runtime_config()
-    try:
-        html = get_html(URL)
-    except requests.RequestException as exc:
-        now = datetime.now(tz=ZoneInfo(TIMEZONE)).strftime("%Y-%m-%d %H:%M")
-        message = f"PizzINT 抓取失败: {exc}"
-        subject = f"[PizzINT] {now} 抓取失败"
-        try:
-            send_email(subject, message, f"<p>{message}</p>")
-        except Exception as mail_exc:
-            print(f"失败告警邮件发送异常: {mail_exc}")
-        print(message)
-        raise SystemExit(1)
-
+    html = get_html(URL)
     snapshot = build_snapshot(html)
     json_path = save_snapshot(snapshot)
 
-    if RUN_MODE == "alert":
-        state = load_state()
-        previous_level = state.get("last_doughcon_level")
-        current_level = snapshot.current_doughcon_level
-
-        should_send = (
-            isinstance(current_level, int)
-            and current_level in ALERT_LEVELS
-            and current_level != previous_level
-        )
-
-        if should_send:
-            subject = (
-                f"[PizzINT Alert] {datetime.now(tz=ZoneInfo(TIMEZONE)).strftime('%Y-%m-%d %H:%M')} "
-                f"DOUGHCON {current_level}"
-            )
-            send_email(
-                subject,
-                render_alert_text(snapshot, previous_level if isinstance(previous_level, int) else None),
-                render_alert_html(snapshot, previous_level if isinstance(previous_level, int) else None),
-            )
-            print(f"已发送告警邮件: DOUGHCON {current_level} (上次: {previous_level})")
-        else:
-            print(
-                "未触发告警: "
-                f"当前={current_level}, 上次={previous_level}, 告警等级={sorted(ALERT_LEVELS)}"
-            )
-
-        state["last_doughcon_level"] = current_level
-        state["last_checked_at_bj"] = snapshot.fetched_at_bj
-        state["site_url"] = snapshot.site_url
-        save_state(state)
-        print(f"状态已保存: {STATE_FILE}")
-        print(f"JSON 已保存: {json_path}")
-        return
-
     subject = (
         f"[PizzINT] {datetime.now(tz=ZoneInfo(TIMEZONE)).strftime('%Y-%m-%d %H:%M')} "
-        f"过去12小时 Doughcon 变化 {len(snapshot.doughcon_changes_12h)} 条"
+        f"Doughcon {snapshot.doughcon_level or '?'} "
+        f"Signal {snapshot.pentagon_signal_score:.1f}"
     )
     text_body = render_email_text(snapshot)
     html_body = render_email_html(snapshot)
     send_email(subject, text_body, html_body)
+
     print(text_body)
-    print(f"\nJSON 已保存: {json_path}")
+    print(f"\nJSON saved: {json_path}")
 
 
 if __name__ == "__main__":
