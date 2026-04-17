@@ -20,6 +20,13 @@ URL = os.getenv("PIZZINT_URL", "https://www.pizzint.watch/")
 TIMEZONE = os.getenv("TIMEZONE", "Asia/Shanghai")
 OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "output"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
+RUN_MODE = os.getenv("RUN_MODE", "daily").strip().lower()
+STATE_FILE = Path(os.getenv("STATE_FILE", str(OUTPUT_DIR / "doughcon_state.json")))
+ALERT_LEVELS = {
+    int(x.strip())
+    for x in os.getenv("ALERT_LEVELS", "1,2").split(",")
+    if x.strip().isdigit() and 1 <= int(x.strip()) <= 5
+} or {1, 2}
 USER_AGENT = os.getenv(
     "USER_AGENT",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -294,6 +301,20 @@ def snapshot_to_dict(snapshot: PizzintSnapshot) -> dict[str, Any]:
     return asdict(snapshot)
 
 
+def load_state() -> dict[str, Any]:
+    if not STATE_FILE.exists():
+        return {}
+    try:
+        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_state(data: dict[str, Any]) -> None:
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 def render_email_text(snapshot: PizzintSnapshot) -> str:
     max_spike = f"{snapshot.max_spike_percent:.1f}%" if snapshot.max_spike_percent is not None else "N/A"
     lines = [
@@ -333,6 +354,21 @@ def render_email_text(snapshot: PizzintSnapshot) -> str:
         for note in snapshot.raw_notes:
             lines.append(f"- {note}")
 
+    return "\n".join(lines)
+
+
+def render_alert_text(snapshot: PizzintSnapshot, previous_level: int | None) -> str:
+    current_level = snapshot.doughcon_level
+    current_label = snapshot.doughcon_label or "Unknown"
+    previous = str(previous_level) if previous_level is not None else "None"
+    level_list = ", ".join(str(x) for x in sorted(ALERT_LEVELS))
+    lines = [
+        f"PizzINT Doughcon Alert (Beijing): {snapshot.fetched_at_bj}",
+        f"URL: {snapshot.site_url}",
+        f"Previous Doughcon: {previous}",
+        f"Current Doughcon: {current_level or 'N/A'} ({current_label})",
+        f"Alert Levels: {level_list}",
+    ]
     return "\n".join(lines)
 
 
@@ -397,6 +433,28 @@ def render_email_html(snapshot: PizzintSnapshot) -> str:
     """
 
 
+def render_alert_html(snapshot: PizzintSnapshot, previous_level: int | None) -> str:
+    current_level = snapshot.doughcon_level
+    current_label = snapshot.doughcon_label or "Unknown"
+    previous = str(previous_level) if previous_level is not None else "None"
+    level_list = ", ".join(f"DOUGHCON {x}" for x in sorted(ALERT_LEVELS))
+    return f"""
+    <html>
+      <body style="font-family: Arial, Helvetica, sans-serif; line-height: 1.5;">
+        <h2>PizzINT Doughcon Alert</h2>
+        <p><strong>Beijing Time:</strong> {snapshot.fetched_at_bj}<br>
+           <strong>UTC:</strong> {snapshot.fetched_at_utc}<br>
+           <strong>URL:</strong> <a href="{snapshot.site_url}">{snapshot.site_url}</a></p>
+        <ul>
+          <li><strong>Previous Doughcon:</strong> {previous}</li>
+          <li><strong>Current Doughcon:</strong> {current_level or 'N/A'} ({current_label})</li>
+          <li><strong>Alert Levels:</strong> {level_list}</li>
+        </ul>
+      </body>
+    </html>
+    """
+
+
 def save_snapshot(snapshot: PizzintSnapshot) -> Path:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(tz=ZoneInfo("UTC")).strftime("%Y%m%dT%H%M%SZ")
@@ -438,6 +496,45 @@ def main() -> None:
     html = get_html(URL)
     snapshot = build_snapshot(html)
     json_path = save_snapshot(snapshot)
+
+    if RUN_MODE == "alert":
+        state = load_state()
+        previous_level = state.get("last_doughcon_level")
+        if not isinstance(previous_level, int):
+            previous_level = None
+
+        current_level = snapshot.doughcon_level
+        should_send = (
+            isinstance(current_level, int)
+            and current_level in ALERT_LEVELS
+            and current_level != previous_level
+        )
+
+        if should_send:
+            subject = (
+                f"[PizzINT Alert] {datetime.now(tz=ZoneInfo(TIMEZONE)).strftime('%Y-%m-%d %H:%M')} "
+                f"DOUGHCON {current_level}"
+            )
+            send_email(
+                subject,
+                render_alert_text(snapshot, previous_level),
+                render_alert_html(snapshot, previous_level),
+            )
+            print(f"Alert sent: current={current_level}, previous={previous_level}")
+        else:
+            print(
+                "Alert not triggered: "
+                f"current={current_level}, previous={previous_level}, levels={sorted(ALERT_LEVELS)}"
+            )
+
+        state["last_doughcon_level"] = current_level if isinstance(current_level, int) else None
+        state["last_checked_at_bj"] = snapshot.fetched_at_bj
+        state["last_checked_at_utc"] = snapshot.fetched_at_utc
+        state["site_url"] = snapshot.site_url
+        save_state(state)
+        print(f"State saved: {STATE_FILE}")
+        print(f"JSON saved: {json_path}")
+        return
 
     subject = (
         f"[PizzINT] {datetime.now(tz=ZoneInfo(TIMEZONE)).strftime('%Y-%m-%d %H:%M')} "
