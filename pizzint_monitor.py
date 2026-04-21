@@ -131,13 +131,35 @@ def extract_text_lines(html: str) -> list[str]:
 
 
 def extract_doughcon(lines: list[str]) -> tuple[int | None, str | None]:
-    for line in lines:
-        m = re.search(r"DOUGHCON\s*(\d+)", line, re.I)
-        if m:
-            level = int(m.group(1))
-            label = DOUGHCON_LABELS.get(level)
-            return level, label
-    return None, None
+    exact_candidates: list[tuple[int, int]] = []
+    loose_candidates: list[tuple[int, int]] = []
+
+    for idx, line in enumerate(lines):
+        exact = re.fullmatch(r"DOUGHCON\s*([1-5])", line, re.I)
+        if exact:
+            exact_candidates.append((idx, int(exact.group(1))))
+            continue
+
+        # Fallback for minor rendering changes (e.g., "DOUGHCON 4 - ...")
+        loose = re.search(r"\bDOUGHCON\s*([1-5])\b", line, re.I)
+        if loose:
+            loose_candidates.append((idx, int(loose.group(1))))
+
+    candidates = exact_candidates or loose_candidates
+    if not candidates:
+        return None, None
+
+    anchor_idx = next(
+        (idx for idx, line in enumerate(lines) if re.search(r"\bLOCATIONS\s+MONITORED\b", line, re.I)),
+        None,
+    )
+    if anchor_idx is not None:
+        candidates.sort(key=lambda item: (abs(item[0] - anchor_idx), item[0]))
+    else:
+        candidates.sort(key=lambda item: item[0])
+
+    level = candidates[0][1]
+    return level, DOUGHCON_LABELS.get(level)
 
 
 def extract_locations_monitored(lines: list[str]) -> int | None:
@@ -504,6 +526,10 @@ def main() -> None:
             previous_level = None
 
         current_level = snapshot.doughcon_level
+        print(
+            "Alert decision input: "
+            f"parsed_doughcon={current_level}, previous={previous_level}, levels={sorted(ALERT_LEVELS)}"
+        )
         should_send = (
             isinstance(current_level, int)
             and current_level in ALERT_LEVELS
